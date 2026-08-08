@@ -127,7 +127,7 @@ def _load_model():
     _log("Unpickling checkpoint...")
     t0 = time.time()
     with open(model_path, "rb") as f:
-        checkpoint = pickle.load(f)
+        checkpoint = torch.load(f, map_location=torch.device('cpu'), weights_only=False)
     _log(f"Checkpoint unpickled in {time.time() - t0:.1f}s")
 
     cfg = checkpoint["config"]
