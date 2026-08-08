@@ -5,7 +5,6 @@ import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pickle
 from flask import Flask, request, jsonify
 from tokenizers import Tokenizer
 from huggingface_hub import hf_hub_download
@@ -29,77 +28,92 @@ def _log(msg):
 class CausalSelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, block_size, dropout):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.c_attn = nn.Linear(embed_dim, 3 * embed_dim)
-        self.c_proj = nn.Linear(embed_dim, embed_dim)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
+        self.num_heads  = num_heads
+        self.head_dim   = embed_dim // num_heads
+        self.qkv        = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.proj       = nn.Linear(embed_dim, embed_dim)
+        self.attn_drop  = dropout
+        self.resid_drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        B, T, C = x.size()
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(C, dim=2)
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=2)
         q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.resid_drop(self.proj(out))
 
 
 class FeedForward(nn.Module):
     def __init__(self, embed_dim, dropout):
         super().__init__()
-        self.c_fc = nn.Linear(embed_dim, 4 * embed_dim)
-        self.c_proj = nn.Linear(4 * embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.GELU(),
+            nn.Linear(4 * embed_dim, embed_dim),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x):
-        x = F.gelu(self.c_fc(x))
-        x = self.dropout(self.c_proj(x))
-        return x
+        return self.net(x)
 
 
-class TransformerBlock(nn.Module):
+class Block(nn.Module):
     def __init__(self, embed_dim, num_heads, block_size, dropout):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(embed_dim)
         self.attn = CausalSelfAttention(embed_dim, num_heads, block_size, dropout)
-        self.ln_2 = nn.LayerNorm(embed_dim)
-        self.mlp = FeedForward(embed_dim, dropout)
+        self.ff   = FeedForward(embed_dim, dropout)
+        self.ln1  = nn.LayerNorm(embed_dim)
+        self.ln2  = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        x = x + self.attn(self.ln1(x))
+        return x + self.ff(self.ln2(x))
 
 
-class SlimGPT(nn.Module):
+class MicroGPT(nn.Module):
     def __init__(self, vocab_size, embed_dim, num_heads, num_layers, block_size, dropout):
         super().__init__()
-        self.block_size = block_size
-        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.position_embedding = nn.Embedding(block_size, embed_dim)
-        self.drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, block_size, dropout)
-            for _ in range(num_layers)
-        ])
-        self.ln_f = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, vocab_size, bias=False)
-        self.head.weight = self.token_embedding.weight
+        self.tok_emb     = nn.Embedding(vocab_size, embed_dim)
+        self.pos_emb     = nn.Embedding(block_size, embed_dim)
+        self.drop        = nn.Dropout(dropout)
+        self.blocks      = nn.Sequential(*[Block(embed_dim, num_heads, block_size, dropout) for _ in range(num_layers)])
+        self.ln          = nn.LayerNorm(embed_dim)
+        self.head        = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.head.weight = self.tok_emb.weight
+        self.block_size  = block_size
 
     def forward(self, idx):
-        B, T = idx.size()
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        x = self.drop(self.token_embedding(idx) + self.position_embedding(pos))
-        for block in self.blocks:
-            x = block(x)
-        x = self.ln_f(x)
-        logits = self.head(x)
+        B, T   = idx.shape
+        x      = self.drop(self.tok_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device)))
+        logits = self.head(self.ln(self.blocks(x)))
         return logits
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50, top_p=0.9, repetition_penalty=1.2, eos_id=None):
+        for _ in range(max_new_tokens):
+            logits = self(idx[:, -self.block_size:])
+            logits = logits[:, -1, :].float() / temperature
+            if repetition_penalty != 1.0:
+                for token_id in set(idx[0].tolist()):
+                    logits[0, token_id] /= repetition_penalty
+            if top_k > 0:
+                vals, _ = torch.topk(logits, top_k)
+                logits = logits.masked_fill(logits < vals[:, -1:], float('-inf'))
+            if top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                remove = cum_probs - F.softmax(sorted_logits, dim=-1) > top_p
+                sorted_logits[remove] = float('-inf')
+                logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+            probs = F.softmax(logits, dim=-1)
+            next_tok = torch.multinomial(probs, 1)
+            idx = torch.cat([idx, next_tok], dim=1)
+            if eos_id is not None and next_tok.item() == eos_id:
+                break
+        return idx
 
 
 def _load_model():
@@ -130,13 +144,12 @@ def _load_model():
         checkpoint = torch.load(f, map_location=torch.device('cpu'), weights_only=False)
     _log(f"Checkpoint unpickled in {time.time() - t0:.1f}s")
 
-    cfg = checkpoint["config"]
-    vocab_size = TOK.get_vocab_size()
+    cfg = checkpoint.get("config", {})
 
-    _log(f"Constructing SlimGPT (vocab={vocab_size}, embed={cfg.get('embed_dim', 448)}, layers={cfg.get('num_layers', 8)})...")
+    _log("Constructing MicroGPT...")
     t0 = time.time()
-    model = SlimGPT(
-        vocab_size=vocab_size,
+    model = MicroGPT(
+        vocab_size=32771,
         embed_dim=cfg.get("embed_dim", 448),
         num_heads=cfg.get("num_heads", 7),
         num_layers=cfg.get("num_layers", 8),
@@ -175,54 +188,6 @@ def ensure_model_loaded():
         _load_model()
 
 
-@torch.no_grad()
-def generate(prompt_ids, max_tokens, temperature, top_k, top_p, repetition_penalty, eos_id):
-    idx = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
-    generated = []
-
-    for _ in range(max_tokens):
-        idx_cond = idx[:, -MODEL.block_size:]
-        logits = MODEL(idx_cond)[:, -1, :].float()
-
-        for token_id in set(prompt_ids + generated):
-            if logits[0, token_id] > 0:
-                logits[0, token_id] /= repetition_penalty
-            else:
-                logits[0, token_id] *= repetition_penalty
-
-        if temperature > 0:
-            logits = logits / temperature
-        else:
-            next_id = logits.argmax(dim=-1).item()
-            if next_id == eos_id:
-                break
-            generated.append(next_id)
-            idx = torch.cat([idx, torch.tensor([[next_id]], device=DEVICE)], dim=1)
-            continue
-
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        probs = F.softmax(sorted_logits, dim=-1)
-        cumulative_probs = torch.cumsum(probs, dim=-1)
-
-        sorted_mask = cumulative_probs - probs > top_p
-        sorted_logits[sorted_mask] = -float("inf")
-
-        if top_k > 0:
-            sorted_logits[:, top_k:] = -float("inf")
-
-        probs = F.softmax(sorted_logits, dim=-1)
-        sampled_index = torch.multinomial(probs, num_samples=1)
-        next_id = sorted_indices.gather(-1, sampled_index).item()
-
-        if next_id == eos_id:
-            break
-
-        generated.append(next_id)
-        idx = torch.cat([idx, torch.tensor([[next_id]], device=DEVICE)], dim=1)
-
-    return generated
-
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "healthy", "model_loaded": _model_loaded})
@@ -242,9 +207,10 @@ def generate_endpoint():
 
     eos_id = TOK.token_to_id("<|eos|>")
 
-    generated_ids = generate(
-        prompt_ids=prompt_ids,
-        max_tokens=max_tokens,
+    idx_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
+    out_tensor = MODEL.generate(
+        idx_tensor,
+        max_new_tokens=max_tokens,
         temperature=temperature,
         top_k=50,
         top_p=0.9,
@@ -252,5 +218,6 @@ def generate_endpoint():
         eos_id=eos_id,
     )
 
-    response_text = TOK.decode(generated_ids)
+    new_ids = out_tensor[0, len(prompt_ids):].tolist()
+    response_text = TOK.decode(new_ids)
     return jsonify({"response": response_text})
