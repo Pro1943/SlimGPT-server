@@ -128,6 +128,7 @@ def load_model():
     model.load_state_dict(cleaned)
     model.eval()
     model.to(DEVICE)
+    model.half()
     MODEL = model
 
 
@@ -138,7 +139,7 @@ def generate(prompt_ids, max_tokens, temperature, top_k, top_p, repetition_penal
 
     for _ in range(max_tokens):
         idx_cond = idx[:, -MODEL.block_size:]
-        logits = MODEL(idx_cond)[:, -1, :]
+        logits = MODEL(idx_cond)[:, -1, :].float()
 
         for token_id in set(prompt_ids + generated):
             if logits[0, token_id] > 0:
