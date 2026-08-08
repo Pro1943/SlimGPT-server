@@ -1,8 +1,8 @@
 import os
 import sys
 import time
-import signal
 import threading
+import concurrent.futures
 import torch
 torch.set_num_threads(1)
 
@@ -22,14 +22,6 @@ TOK = None
 DEVICE = torch.device("cpu")
 _model_lock = threading.Lock()
 _model_loaded = False
-
-
-class GenerationTimeoutError(Exception):
-    pass
-
-
-def _alarm_handler(signum, frame):
-    raise GenerationTimeoutError("Generation request timed out after 90s")
 
 
 def _log(msg):
@@ -231,31 +223,27 @@ def generate_endpoint():
     eos_id = TOK.token_to_id("<|eos|>")
     _log(f"Calling MODEL.generate with eos_id={eos_id!r} (prompt_len={len(prompt_ids)})...")
 
-    use_alarm = hasattr(signal, "SIGALRM")
-    if use_alarm:
-        signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(90)
+    idx_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
 
     try:
-        idx_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
-        out_tensor = MODEL.generate(
-            idx_tensor,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_k=50,
-            top_p=0.9,
-            repetition_penalty=1.2,
-            eos_id=eos_id,
-        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                MODEL.generate,
+                idx_tensor,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_k=50,
+                top_p=0.9,
+                repetition_penalty=1.2,
+                eos_id=eos_id,
+            )
+            out_tensor = future.result(timeout=90)
         t1 = time.time()
         num_generated = out_tensor.size(1) - len(prompt_ids)
         _log(f"MODEL.generate returned {num_generated} tokens in {t1 - t0:.2f}s")
-    except GenerationTimeoutError:
+    except concurrent.futures.TimeoutError:
         _log("Generation timed out after 90s!")
-        return jsonify({"error": "Generation timed out after 90 seconds"}), 504
-    finally:
-        if use_alarm:
-            signal.alarm(0)
+        return jsonify({"error": "generation timed out after 90s"}), 504
 
     new_ids = out_tensor[0, len(prompt_ids):].tolist()
     response_text = TOK.decode(new_ids)
