@@ -210,11 +210,10 @@ def generate_endpoint():
 
     data = request.get_json(force=True)
     prompt = data.get("prompt", "")
+    max_tokens = data.get("max_tokens", 150)
     temperature = data.get("temperature", 1.0)
-    # DEBUG: hardcode max_tokens to 5 for debugging pass
-    max_tokens = 5
 
-    _log(f"Received /generate request: prompt={prompt!r}, max_tokens={max_tokens} (debug hardcoded), temp={temperature}")
+    _log(f"Received /generate request: prompt={prompt!r}, max_tokens={max_tokens}, temp={temperature}")
     t0 = time.time()
 
     wrapped = f"<|user|>{prompt}<|assistant|>"
@@ -237,13 +236,13 @@ def generate_endpoint():
                 repetition_penalty=1.2,
                 eos_id=eos_id,
             )
-            out_tensor = future.result(timeout=90)
+            out_tensor = future.result(timeout=180)
         t1 = time.time()
         num_generated = out_tensor.size(1) - len(prompt_ids)
         _log(f"MODEL.generate returned {num_generated} tokens in {t1 - t0:.2f}s")
     except concurrent.futures.TimeoutError:
-        _log("Generation timed out after 90s!")
-        return jsonify({"error": "generation timed out after 90s"}), 504
+        _log("Generation timed out after 180s!")
+        return jsonify({"error": "generation timed out after 180s"}), 504
 
     new_ids = out_tensor[0, len(prompt_ids):].tolist()
     response_text = TOK.decode(new_ids)
