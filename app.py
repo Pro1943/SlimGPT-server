@@ -1,10 +1,11 @@
 import os
-import math
+import sys
+import time
+import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pickle
-import numpy as np
 from flask import Flask, request, jsonify
 from tokenizers import Tokenizer
 from huggingface_hub import hf_hub_download
@@ -17,6 +18,12 @@ app = Flask(__name__)
 MODEL = None
 TOK = None
 DEVICE = torch.device("cpu")
+_model_lock = threading.Lock()
+_model_loaded = False
+
+
+def _log(msg):
+    print(f"[SlimGPT] {msg}", flush=True)
 
 
 class CausalSelfAttention(nn.Module):
@@ -95,23 +102,39 @@ class SlimGPT(nn.Module):
         return logits
 
 
-def load_model():
-    global MODEL, TOK
+def _load_model():
+    global MODEL, TOK, _model_loaded
 
+    t_total = time.time()
     hf_token = os.environ.get("HF_TOKEN", None)
     repo_id = "Pro1943/SlimGPT-deploy"
 
+    _log("Downloading tokenizer.json from HF Hub...")
+    t0 = time.time()
     tok_path = hf_hub_download(repo_id=repo_id, filename="tokenizer.json", token=hf_token)
+    _log(f"Tokenizer downloaded in {time.time() - t0:.1f}s")
+
+    _log("Downloading model.pkl from HF Hub...")
+    t0 = time.time()
     model_path = hf_hub_download(repo_id=repo_id, filename="model.pkl", token=hf_token)
+    _log(f"model.pkl downloaded in {time.time() - t0:.1f}s")
 
+    _log("Loading tokenizer...")
+    t0 = time.time()
     TOK = Tokenizer.from_file(tok_path)
+    _log(f"Tokenizer loaded in {time.time() - t0:.1f}s")
 
+    _log("Unpickling checkpoint...")
+    t0 = time.time()
     with open(model_path, "rb") as f:
         checkpoint = pickle.load(f)
+    _log(f"Checkpoint unpickled in {time.time() - t0:.1f}s")
 
     cfg = checkpoint["config"]
     vocab_size = TOK.get_vocab_size()
 
+    _log(f"Constructing SlimGPT (vocab={vocab_size}, embed={cfg.get('embed_dim', 448)}, layers={cfg.get('num_layers', 8)})...")
+    t0 = time.time()
     model = SlimGPT(
         vocab_size=vocab_size,
         embed_dim=cfg.get("embed_dim", 448),
@@ -120,16 +143,40 @@ def load_model():
         block_size=cfg.get("block_size", 384),
         dropout=0.0,
     )
+    _log(f"Model constructed in {time.time() - t0:.1f}s")
 
+    _log("Loading state dict...")
+    t0 = time.time()
     state_dict = checkpoint["model_state"]
     cleaned = {}
     for k, v in state_dict.items():
         cleaned[k.replace("module.", "", 1) if k.startswith("module.") else k] = v
     model.load_state_dict(cleaned)
+    _log(f"State dict loaded in {time.time() - t0:.1f}s")
+
+    del checkpoint, state_dict, cleaned
+
     model.eval()
     model.to(DEVICE)
+
+    _log("Casting model to fp16...")
+    t0 = time.time()
     model.half()
+    _log(f"fp16 cast done in {time.time() - t0:.1f}s")
+
     MODEL = model
+    _model_loaded = True
+    _log(f"Model ready. Total load time: {time.time() - t_total:.1f}s")
+
+
+def ensure_model_loaded():
+    global _model_loaded
+    if _model_loaded:
+        return
+    with _model_lock:
+        if _model_loaded:
+            return
+        _load_model()
 
 
 @torch.no_grad()
@@ -182,13 +229,12 @@ def generate(prompt_ids, max_tokens, temperature, top_k, top_p, repetition_penal
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "healthy", "model_loaded": MODEL is not None})
+    return jsonify({"status": "healthy", "model_loaded": _model_loaded})
 
 
 @app.route("/generate", methods=["POST"])
 def generate_endpoint():
-    if MODEL is None or TOK is None:
-        return jsonify({"error": "Model not loaded"}), 503
+    ensure_model_loaded()
 
     data = request.get_json(force=True)
     prompt = data.get("prompt", "")
@@ -212,6 +258,3 @@ def generate_endpoint():
 
     response_text = TOK.decode(generated_ids)
     return jsonify({"response": response_text})
-
-
-load_model()

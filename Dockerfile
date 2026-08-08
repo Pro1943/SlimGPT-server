@@ -10,4 +10,4 @@ COPY . .
 
 ENV PORT=10000
 
-CMD gunicorn --workers 1 --threads 2 --timeout 120 --bind 0.0.0.0:$PORT app:app
+CMD gunicorn --workers 1 --threads 2 --timeout 300 --bind 0.0.0.0:$PORT app:app
