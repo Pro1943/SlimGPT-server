@@ -147,14 +147,10 @@ def _load_model():
 
     _log("Loading state dict...")
     t0 = time.time()
-    state_dict = checkpoint["model_state"]
-    cleaned = {}
-    for k, v in state_dict.items():
-        cleaned[k.replace("module.", "", 1) if k.startswith("module.") else k] = v
-    model.load_state_dict(cleaned)
+    model.load_state_dict(checkpoint["model_state"])
     _log(f"State dict loaded in {time.time() - t0:.1f}s")
 
-    del checkpoint, state_dict, cleaned
+    del checkpoint
 
     model.eval()
     model.to(DEVICE)
