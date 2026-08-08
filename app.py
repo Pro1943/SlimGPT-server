@@ -1,8 +1,11 @@
 import os
 import sys
 import time
+import signal
 import threading
 import torch
+torch.set_num_threads(1)
+
 import torch.nn as nn
 import torch.nn.functional as F
 from flask import Flask, request, jsonify
@@ -19,6 +22,14 @@ TOK = None
 DEVICE = torch.device("cpu")
 _model_lock = threading.Lock()
 _model_loaded = False
+
+
+class GenerationTimeoutError(Exception):
+    pass
+
+
+def _alarm_handler(signum, frame):
+    raise GenerationTimeoutError("Generation request timed out after 90s")
 
 
 def _log(msg):
@@ -96,7 +107,8 @@ class MicroGPT(nn.Module):
         _log(f"Starting generation (max_new_tokens={max_new_tokens}, prompt_len={idx.size(1)})...")
         t_start = time.time()
         tokens_generated = 0
-        for _ in range(max_new_tokens):
+        for i in range(max_new_tokens):
+            _log(f"[gen] token {i} at {time.time() - t_start:.2f}s")
             logits = self(idx[:, -self.block_size:])
             logits = logits[:, -1, :].float() / temperature
             if repetition_penalty != 1.0:
@@ -206,27 +218,44 @@ def generate_endpoint():
 
     data = request.get_json(force=True)
     prompt = data.get("prompt", "")
-    max_tokens = data.get("max_tokens", 150)
     temperature = data.get("temperature", 1.0)
+    # DEBUG: hardcode max_tokens to 5 for debugging pass
+    max_tokens = 5
 
-    _log(f"Received /generate request: prompt={prompt!r}, max_tokens={max_tokens}, temp={temperature}")
+    _log(f"Received /generate request: prompt={prompt!r}, max_tokens={max_tokens} (debug hardcoded), temp={temperature}")
     t0 = time.time()
 
     wrapped = f"<|user|>{prompt}<|assistant|>"
     prompt_ids = TOK.encode(wrapped).ids
 
     eos_id = TOK.token_to_id("<|eos|>")
+    _log(f"Calling MODEL.generate with eos_id={eos_id!r} (prompt_len={len(prompt_ids)})...")
 
-    idx_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
-    out_tensor = MODEL.generate(
-        idx_tensor,
-        max_new_tokens=max_tokens,
-        temperature=temperature,
-        top_k=50,
-        top_p=0.9,
-        repetition_penalty=1.2,
-        eos_id=eos_id,
-    )
+    use_alarm = hasattr(signal, "SIGALRM")
+    if use_alarm:
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(90)
+
+    try:
+        idx_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
+        out_tensor = MODEL.generate(
+            idx_tensor,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            top_k=50,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            eos_id=eos_id,
+        )
+        t1 = time.time()
+        num_generated = out_tensor.size(1) - len(prompt_ids)
+        _log(f"MODEL.generate returned {num_generated} tokens in {t1 - t0:.2f}s")
+    except GenerationTimeoutError:
+        _log("Generation timed out after 90s!")
+        return jsonify({"error": "Generation timed out after 90 seconds"}), 504
+    finally:
+        if use_alarm:
+            signal.alarm(0)
 
     new_ids = out_tensor[0, len(prompt_ids):].tolist()
     response_text = TOK.decode(new_ids)
