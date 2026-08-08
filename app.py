@@ -93,6 +93,9 @@ class MicroGPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50, top_p=0.9, repetition_penalty=1.2, eos_id=None):
+        _log(f"Starting generation (max_new_tokens={max_new_tokens}, prompt_len={idx.size(1)})...")
+        t_start = time.time()
+        tokens_generated = 0
         for _ in range(max_new_tokens):
             logits = self(idx[:, -self.block_size:])
             logits = logits[:, -1, :].float() / temperature
@@ -111,8 +114,12 @@ class MicroGPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             next_tok = torch.multinomial(probs, 1)
             idx = torch.cat([idx, next_tok], dim=1)
+            tokens_generated += 1
             if eos_id is not None and next_tok.item() == eos_id:
                 break
+        elapsed = time.time() - t_start
+        speed = tokens_generated / elapsed if elapsed > 0 else 0.0
+        _log(f"Generation complete: {tokens_generated} tokens in {elapsed:.2f}s ({speed:.2f} tok/s)")
         return idx
 
 
@@ -165,13 +172,13 @@ def _load_model():
 
     del checkpoint
 
+    _log("Casting model to fp32...")
+    t0 = time.time()
+    model.float()
+    _log(f"fp32 cast done in {time.time() - t0:.1f}s")
+
     model.eval()
     model.to(DEVICE)
-
-    _log("Casting model to fp16...")
-    t0 = time.time()
-    model.half()
-    _log(f"fp16 cast done in {time.time() - t0:.1f}s")
 
     MODEL = model
     _model_loaded = True
@@ -202,6 +209,9 @@ def generate_endpoint():
     max_tokens = data.get("max_tokens", 150)
     temperature = data.get("temperature", 1.0)
 
+    _log(f"Received /generate request: prompt={prompt!r}, max_tokens={max_tokens}, temp={temperature}")
+    t0 = time.time()
+
     wrapped = f"<|user|>{prompt}<|assistant|>"
     prompt_ids = TOK.encode(wrapped).ids
 
@@ -220,4 +230,5 @@ def generate_endpoint():
 
     new_ids = out_tensor[0, len(prompt_ids):].tolist()
     response_text = TOK.decode(new_ids)
+    _log(f"Endpoint total request duration: {time.time() - t0:.2f}s")
     return jsonify({"response": response_text})
