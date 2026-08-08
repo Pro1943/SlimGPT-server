@@ -1,0 +1,7 @@
+flask
+gunicorn
+torch --index-url https://download.pytorch.org/whl/cpu
+tokenizers
+huggingface_hub
+numpy
+python-dotenv
