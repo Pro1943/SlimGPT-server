@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import json
+import queue
 import threading
 import concurrent.futures
 import torch
@@ -8,7 +10,7 @@ torch.set_num_threads(1)
 
 import torch.nn as nn
 import torch.nn.functional as F
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from tokenizers import Tokenizer
 from huggingface_hub import hf_hub_download
 from dotenv import load_dotenv
@@ -95,12 +97,11 @@ class MicroGPT(nn.Module):
         return logits
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50, top_p=0.9, repetition_penalty=1.2, eos_id=None):
-        _log(f"Starting generation (max_new_tokens={max_new_tokens}, prompt_len={idx.size(1)})...")
+    def generate_stream(self, idx, max_new_tokens, temperature=1.0, top_k=50, top_p=0.9, repetition_penalty=1.2, eos_id=None):
+        _log(f"Starting streaming generation (max_new_tokens={max_new_tokens}, prompt_len={idx.size(1)})...")
         t_start = time.time()
-        tokens_generated = 0
+        generated_ids = []
         for i in range(max_new_tokens):
-            _log(f"[gen] token {i} at {time.time() - t_start:.2f}s")
             logits = self(idx[:, -self.block_size:])
             logits = logits[:, -1, :].float() / temperature
             if repetition_penalty != 1.0:
@@ -118,13 +119,27 @@ class MicroGPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             next_tok = torch.multinomial(probs, 1)
             idx = torch.cat([idx, next_tok], dim=1)
-            tokens_generated += 1
-            if eos_id is not None and next_tok.item() == eos_id:
+            next_id = next_tok.item()
+            generated_ids.append(next_id)
+            elapsed = time.time() - t_start
+            yield i, next_id, generated_ids, elapsed, idx
+            if eos_id is not None and next_id == eos_id:
                 break
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50, top_p=0.9, repetition_penalty=1.2, eos_id=None):
+        _log(f"Starting generation (max_new_tokens={max_new_tokens}, prompt_len={idx.size(1)})...")
+        t_start = time.time()
+        tokens_generated = 0
+        last_idx = idx
+        for i, next_id, gen_ids, elapsed, curr_idx in self.generate_stream(idx, max_new_tokens, temperature, top_k, top_p, repetition_penalty, eos_id):
+            tokens_generated += 1
+            _log(f"[gen] token {i} at {elapsed:.2f}s")
+            last_idx = curr_idx
         elapsed = time.time() - t_start
         speed = tokens_generated / elapsed if elapsed > 0 else 0.0
         _log(f"Generation complete: {tokens_generated} tokens in {elapsed:.2f}s ({speed:.2f} tok/s)")
-        return idx
+        return last_idx
 
 
 def _load_model():
@@ -248,3 +263,78 @@ def generate_endpoint():
     response_text = TOK.decode(new_ids)
     _log(f"Endpoint total request duration: {time.time() - t0:.2f}s")
     return jsonify({"response": response_text})
+
+
+@app.route("/generate/stream", methods=["POST"])
+def generate_stream_endpoint():
+    ensure_model_loaded()
+
+    data = request.get_json(force=True)
+    prompt = data.get("prompt", "")
+    max_tokens = data.get("max_tokens", 150)
+    temperature = data.get("temperature", 1.0)
+
+    _log(f"Received /generate/stream request: prompt={prompt!r}, max_tokens={max_tokens}, temp={temperature}")
+
+    wrapped = f"<|user|>{prompt}<|assistant|>"
+    prompt_ids = TOK.encode(wrapped).ids
+    eos_id = TOK.token_to_id("<|eos|>")
+
+    idx_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
+
+    def sse_generator():
+        q = queue.Queue()
+
+        def producer():
+            try:
+                final_gen_ids = []
+                total_elapsed = 0.0
+
+                for i, next_id, gen_ids, elapsed, curr_idx in MODEL.generate_stream(
+                    idx_tensor,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    top_k=50,
+                    top_p=0.9,
+                    repetition_penalty=1.2,
+                    eos_id=eos_id,
+                ):
+                    final_gen_ids = gen_ids
+                    total_elapsed = elapsed
+                    decoded_text = TOK.decode(gen_ids)
+                    q.put({
+                        "type": "token",
+                        "index": i,
+                        "elapsed": round(elapsed, 4),
+                        "text_so_far": decoded_text,
+                    })
+
+                final_text = TOK.decode(final_gen_ids)
+                q.put({
+                    "type": "done",
+                    "total_tokens": len(final_gen_ids),
+                    "elapsed": round(total_elapsed, 4),
+                    "response": final_text,
+                })
+                q.put(None)
+            except Exception as e:
+                q.put({"type": "error", "message": str(e)})
+                q.put(None)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        executor.submit(producer)
+        executor.shutdown(wait=False)
+
+        while True:
+            try:
+                event = q.get(timeout=180)
+            except queue.Empty:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'generation timed out after 180s'})}\n\n"
+                break
+
+            if event is None:
+                break
+
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return Response(sse_generator(), mimetype="text/event-stream")
